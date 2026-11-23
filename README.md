@@ -20,6 +20,65 @@ ViNoter · 超级视记Agent
 
 ![overview_zh.png](overview_zh.png)
 
+## 🔧 本 Fork 的工程改进（Engineering Improvements in This Fork）
+
+本仓库 Fork 自 [zrt-ai-lab/ViNote](https://github.com/zrt-ai-lab/ViNote)，以提交 `e8e46a1` 为本轮可靠性改造基线，并继续遵循原项目的 [MIT License](LICENSE)。视频检索与下载、本地 ASR、笔记/摘要/问答/卡片/导图、SQLite 笔记库、分类标签和 Agent 工具编排等核心产品能力来自上游项目；本节只记录当前 Fork 在该基线上实际完成的增量工程工作。
+
+### 本 Fork 已完成的改造
+
+| 方向 | 改造前的问题 | 当前方案 | 验证范围 |
+|---|---|---|---|
+| AI 输出可靠性与来源忠实度 | 推理 token 可能耗尽正文预算；重生成会把标题/来源元数据带入摘要；含糊的口述 SQL 可能被补成确定代码；成功重生成后可能残留旧警告 | 兼容 DeepSeek `reasoning_effort=none`；摘要和导图只读取产物正文；对未出现清晰代码块的口述 SQL 移除未经来源支持的精确语句；全部目标成功后再清除旧警告 | 内容生成、推理配置和存储重生成回归测试；一份 6,929 字符技术转录的历史完整链路复验 |
+| 独立思维导图任务恢复 | 文本导图是同步请求；页面切换会丢失草稿、任务 ID 和结果；提交响应丢失可能造成重复任务；取消状态含义不清 | 文本/视频导图统一为后台任务；客户端生成 UUID `request_id`，服务端按请求 ID 和输入指纹复用单进程任务；`sessionStorage` 保存当前标签页的草稿和任务指针；状态查询与 SSE 可重新附着；取消先记录请求，再等待 worker 确认 | 7 个后端任务语义测试、3 个前端会话恢复测试，以及独立 Docker/Playwright 三场景测试入口 |
+| Markmap 显示区域 | 独立工具页的 SVG 只占固定最小高度，较高面板中的节点可能被裁切；布局变化后 fit 时机不稳定 | 让工具页视口继承可用高度；用 `ResizeObserver`、窗口 resize 和双帧调度，在容器可测量后执行 fit；卸载时清理观察器和动画帧 | 3 个视口单元测试、TypeScript 构建和两个使用共享组件页面的历史人工验收 |
+| Docker 构建与模型缓存 | Debian HTTP 软件源在部分网络环境失败；重建容器可能重复下载 ASR 模型 | Debian 源改用 HTTPS；将 Hugging Face 缓存放入已有 `/app/temp` 持久卷 | Compose 静态校验；镜像构建仍依赖当前机器的 Docker Linux 引擎和外部网络 |
+
+### 工程案例一：AI 模型输出不完整
+
+项目原有的内容调用层已经能识别空正文、拒答和 `finish_reason=length`，并对单次空响应做有界重试。本 Fork 的排查进一步复现了“HTTP 200 但正文为空”的原因：一份 6,929 字符的技术转录在 `reasoning_effort=low` 下，两次整理请求都用满 4,000 completion tokens，且全部消耗在推理内容中。改用供应商支持的 `none` 后，正式重生成链路的整理、分块摘要、摘要整合和导图共 5 次请求均以 `finish_reason=stop` 返回非空正文，原始转录哈希保持不变，旧降级警告在全部产物成功提交后清空。
+
+修复没有通过静默增加 token 上限来提高费用，而是把推理参数显式化，并收紧来源规则：只有源文本包含清晰、可核验代码时才输出精确 SQL；标题、来源链接和页脚不再作为摘要或导图证据。上述完整模型复验属于历史证据，不意味着所有模型、网关和视频都已验证。
+
+### 工程案例二：思维导图任务状态恢复
+
+页面卸载只应停止观察，不应取消后台任务。当前实现把文本导图改成异步任务，并在提交前保存 `request_id`；如果 HTTP 响应丢失，客户端可用相同 ID 重试，服务端返回已有 `task_id`。页面重挂载后先查询状态，再通过 SSE/轮询继续观察。显式取消会先显示“等待后台确认”，worker 确认后才进入 `cancelled`，晚到结果不会覆盖取消状态。
+
+该实现有明确边界：去重通过单进程任务字典扫描完成，不是跨进程强一致幂等；`tasks.json` 保存的是任务快照，服务重启会把在途任务标记为中断，而不会断点续跑；取消 Python 协程也不保证远端模型请求立即停止或停止计费。
+
+### 本地验证与复现
+
+以下检查不需要真实 API Key；CI 会设置空 `OPENAI_API_KEY` 并禁用 `.env` 自动加载：
+
+```bash
+# 后端、Agent 工具、发布结构与敏感信息扫描
+python -m unittest discover -s tests -v
+node --test tests/agent_runtime_plugin.test.mjs
+python scripts/validate_release.py
+python scripts/scan_release.py
+
+# 前端
+cd web
+npm ci
+npm test
+npm run lint
+npm run build
+```
+
+真实前端 + FastAPI 的导图恢复测试使用固定假模型、独立端口、临时容器，并且不挂载现有 ViNote 数据卷：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tests/run_mindmap_integration.ps1
+```
+
+该入口验证“生成时离开页面后完成”“离开期间模型失败”“相同 `request_id` 实际重复提交”三个场景。它要求 Docker Linux 引擎和本机 Chrome/Playwright 可用，不调用付费模型。GitHub Actions 的现有 Windows/Linux 检查会自动发现新增的 Python 与 Node 单元测试；Docker/Playwright 集成测试仍作为独立入口，不应把本地结果表述为 GitHub Actions 已通过。
+
+### 已知限制与后续方向
+
+- 当前仍是单用户、本机优先工具，不应直接暴露到公网。
+- 导图任务尚未迁移到 SQLite 原子状态机，也没有跨 worker 租约、阶段检查点或重启续跑。
+- 视频问答仍使用有界词法召回，尚未完成带时间戳引用的检索评测或混合 RAG。
+- 知识卡片和独立导图还没有统一到可版本化的知识产物模型。
+
 ## ✨ 核心特性
 
 ### 🤖 ViNoter 超级智能体 🔥
@@ -108,7 +167,7 @@ Docker 方式不需要在宿主机安装 Python、Node.js 或 FFmpeg。
 这是单用户工具，没有账号权限隔离。默认只监听本机；不要直接暴露到公网。需要可信局域网或反向代理访问时，可在 `.env` 设置 `APP_BIND_HOST=0.0.0.0`（Docker），把实际访问域名/IP加入 `ALLOWED_HOSTS`（默认 `localhost,127.0.0.1,::1`），并在入口配置访问控制；跨域前端需把准确来源加入 `CORS_ORIGINS`。
 
 ```bash
-git clone https://github.com/zrt-ai-lab/ViNote.git
+git clone https://github.com/s1135766212-spec/ViNote.git
 cd ViNote
 
 cp .env.example .env
@@ -174,7 +233,7 @@ powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 启动：
 
 ```bash
-git clone https://github.com/zrt-ai-lab/ViNote.git
+git clone https://github.com/s1135766212-spec/ViNote.git
 cd ViNote
 
 # macOS / Linux
@@ -569,8 +628,9 @@ cp cookies.txt.example bilibili_cookies.txt
 
 ## 💬 联系方式
 
-- 问题反馈: [GitHub Issues](https://github.com/zrt-ai-lab/ViNote/issues)
-- 邮箱: 864410260@qq.com
+- 本 Fork 问题反馈: [s1135766212-spec/ViNote Issues](https://github.com/s1135766212-spec/ViNote/issues)
+- 上游项目问题反馈: [zrt-ai-lab/ViNote Issues](https://github.com/zrt-ai-lab/ViNote/issues)
+- 原项目联系邮箱: 864410260@qq.com
 
 ---
 
