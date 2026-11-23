@@ -18,6 +18,23 @@ logger = logging.getLogger(__name__)
 _background_tasks: set[asyncio.Task] = set()
 
 
+def mark_interrupted_tasks(task_map: dict) -> bool:
+    """Mark persisted in-flight work as interrupted; never imply it was resumed."""
+    interrupted = False
+    for task_data in task_map.values():
+        if task_data.get("status") not in {"queued", "processing"}:
+            continue
+        task_data.update({
+            "status": "error",
+            "error": "应用上次运行已中断",
+            "message": "任务因应用重启而中断，请重新提交",
+        })
+        if task_data.get("task_type") == "mindmap":
+            task_data["cancel_requested"] = False
+        interrupted = True
+    return interrupted
+
+
 async def cleanup_stale_sse_connections():
     """定期清理断开或过期的 SSE 连接（只清理已完成/失败的任务连接）"""
     while True:
@@ -158,16 +175,7 @@ async def startup_event():
     from backend.services.note_search import backfill_note_search
     await backfill_note_search()
 
-    interrupted = False
-    for task_data in tasks.values():
-        if task_data.get("status") in {"queued", "processing"}:
-            task_data.update({
-                "status": "error",
-                "error": "应用上次运行已中断",
-                "message": "任务因应用重启而中断，请重新提交",
-            })
-            interrupted = True
-    if interrupted:
+    if mark_interrupted_tasks(tasks):
         save_tasks(tasks)
 
     from backend.config.ai_config import get_openai_config

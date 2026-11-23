@@ -28,6 +28,7 @@ export interface TaskStatus {
   translation_path?: string;
   translation_filename?: string;
   warnings?: string[];
+  cancel_requested?: boolean;
 }
 
 export interface VideoInfo {

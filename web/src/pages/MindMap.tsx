@@ -1,134 +1,185 @@
-import { useState, useEffect, useRef, lazy, Suspense } from 'react';
+import { useCallback, useEffect, useRef, useState, lazy, Suspense } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import { postFormData, postJSON, fetchJSON, extractBilibiliUrl, deleteAPI } from '../api/client';
-import { useSSE } from '../hooks/useSSE';
+import { fetchJSON, postFormData, postJSON, extractBilibiliUrl } from '../api/client';
+import { useTaskProgress } from '../hooks/useTaskProgress';
 import ProgressBar from '../components/ProgressBar';
 import { toast } from '../components/toastStore';
 import type { TaskStatus } from '../types';
+import {
+  createMindMapSubmission,
+  emptyMindMapSession,
+  readMindMapSession,
+  writeMindMapSession,
+  type MindMapSession,
+  type MindMapSubmission,
+} from '../utils/mindmapTaskRecovery';
 import { BrainCircuit, Play, Loader2, Square } from 'lucide-react';
 
 const MarkmapView = lazy(() => import('../components/MarkmapView'));
-
 type InputMode = 'text' | 'video';
+
+async function postMindMapSubmission(submission: MindMapSubmission): Promise<string> {
+  if (submission.kind === 'text') {
+    const response = await postJSON<{ task_id: string }>('/api/text-to-mindmap', {
+      content: submission.content,
+      language: submission.language,
+      request_id: submission.requestId,
+    });
+    return response.task_id;
+  }
+  const response = await postFormData<{ task_id: string }>('/api/video-to-mindmap', {
+    url: submission.url,
+    language: submission.language,
+    request_id: submission.requestId,
+  });
+  return response.task_id;
+}
 
 export default function MindMap() {
   const [searchParams] = useSearchParams();
-  const [mode, setMode] = useState<InputMode>('text');
+  const [session, setSession] = useState<MindMapSession>(
+    () => readMindMapSession() || emptyMindMapSession(),
+  );
+  const sessionRef = useRef(session);
+  const launchedRequestIds = useRef(new Set<string>());
+  const autoLoadSourceIds = useRef(new Set<string>());
 
-  const [textContent, setTextContent] = useState('');
-  const [textLoading, setTextLoading] = useState(false);
+  const updateSession = useCallback((patch: Partial<MindMapSession>) => {
+    const next = { ...sessionRef.current, ...patch };
+    sessionRef.current = next;
+    writeMindMapSession(next);
+    setSession(next);
+  }, []);
 
-  const [url, setUrl] = useState('');
-  const [videoLoading, setVideoLoading] = useState(false);
-  const [progress, setProgress] = useState(0);
-  const [statusMessage, setStatusMessage] = useState('');
-  const [taskId, setTaskId] = useState<string | null>(null);
-  const { connect, disconnect } = useSSE();
+  const startSubmission = useCallback(async (submission: MindMapSubmission) => {
+    launchedRequestIds.current.add(submission.requestId);
+    updateSession({
+      mode: submission.kind,
+      url: submission.kind === 'video' ? submission.url : sessionRef.current.url,
+      textContent: submission.kind === 'text' ? submission.content : sessionRef.current.textContent,
+      taskId: null,
+      pendingSubmission: submission,
+      mindmapContent: '',
+      status: 'processing',
+      progress: 0,
+      statusMessage: '正在提交任务...',
+      error: '',
+      cancelRequested: false,
+    });
+    try {
+      const taskId = await postMindMapSubmission(submission);
+      updateSession({ taskId, pendingSubmission: null, status: 'processing', statusMessage: '任务已提交' });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '提交结果暂不可确认';
+      updateSession({
+        error: `${message}。可用相同 request_id 重试确认任务，不会创建重复任务。`,
+        status: null,
+        statusMessage: '等待确认任务是否已创建',
+      });
+    }
+  }, [updateSession]);
 
-  const [mindmapContent, setMindmapContent] = useState('');
-  const autoLoadedRef = useRef<string | null>(null);
+  const handleTaskUpdate = useCallback((task: TaskStatus) => {
+    const wasTerminal = ['completed', 'error', 'cancelled'].includes(sessionRef.current.status || '');
+    updateSession({
+      status: task.status,
+      progress: task.progress || 0,
+      statusMessage: task.message || '',
+      error: task.error || '',
+      cancelRequested: task.cancel_requested === true,
+      mindmapContent: task.status === 'completed' ? (task.mindmap || '') : sessionRef.current.mindmapContent,
+    });
+    if (task.status === 'completed' && task.mindmap && !wasTerminal) {
+      toast('思维导图生成完成！', 'success');
+    } else if (task.status === 'error' && !wasTerminal) {
+      toast(task.error || '思维导图任务失败', 'error');
+    } else if (task.status === 'cancelled' && !wasTerminal) {
+      toast('后台任务已确认取消', 'info');
+    }
+  }, [updateSession]);
 
+  const handleUnavailable = useCallback((error: Error) => {
+    const status = (error as Error & { status?: number }).status;
+    updateSession({
+      status: 'error',
+      error: status === 404
+        ? '任务记录已失效或不存在。未自动重新生成，请手动提交新任务。'
+        : `任务状态暂时无法读取：${error.message}`,
+      statusMessage: '任务无法恢复',
+      cancelRequested: false,
+    });
+  }, [updateSession]);
+
+  useTaskProgress(session.taskId, handleTaskUpdate, handleUnavailable);
+
+  // An unresolved submit may have reached the server even if its HTTP response was lost.
+  // Replaying the same request_id lets the server return the original task instead of spawning a duplicate.
   useEffect(() => {
-    const tid = searchParams.get('taskId');
+    const pending = session.pendingSubmission;
+    if (!pending || session.taskId || launchedRequestIds.current.has(pending.requestId)) return;
+    void startSubmission(pending);
+  }, [session.pendingSubmission, session.taskId, startSubmission]);
+
+  // History links may ask this page to build a mind map from a saved note. Record the
+  // source task before loading it so navigation/remount does not silently launch it twice.
+  useEffect(() => {
+    const sourceTaskId = searchParams.get('taskId');
     const field = searchParams.get('field') || 'summary';
-    if (!tid || autoLoadedRef.current === tid) return;
-    autoLoadedRef.current = tid;
-    setMode('text');
-    setTextLoading(true);
-    setMindmapContent('');
-    fetchJSON<{ content: string }>(`/api/tasks/${tid}/content?field=${field}`)
-      .then(async (res) => {
-        setTextContent(res.content);
-        const result = await postJSON<{ mindmap: string }>('/api/generate-mindmap', {
-          content: res.content,
-          language: 'zh',
-        });
-        setMindmapContent(result.mindmap);
-        toast('思维导图已生成', 'success');
+    if (!sourceTaskId || autoLoadSourceIds.current.has(sourceTaskId)) return;
+    autoLoadSourceIds.current.add(sourceTaskId);
+    const savedSession = sessionRef.current;
+    const requestId = savedSession.autoSourceTaskId === sourceTaskId
+      ? (savedSession.autoSourceRequestId || crypto.randomUUID())
+      : crypto.randomUUID();
+    updateSession({
+      mode: 'text', autoSourceTaskId: sourceTaskId, autoSourceRequestId: requestId,
+      status: null, error: '',
+    });
+    void fetchJSON<{ content: string }>(`/api/tasks/${encodeURIComponent(sourceTaskId)}/content?field=${encodeURIComponent(field)}`)
+      .then(({ content }) => {
+        const nextContent = content.trim();
+        updateSession({ textContent: nextContent });
+        if (nextContent) {
+          void startSubmission({ kind: 'text', requestId, content: nextContent, language: 'zh' });
+        }
       })
-      .catch(() => toast('自动生成失败', 'error'))
-      .finally(() => setTextLoading(false));
-  }, [searchParams]);
+      .catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : '读取历史笔记失败';
+        updateSession({ status: 'error', error: message, statusMessage: '无法读取历史笔记' });
+        toast(message, 'error');
+      });
+  }, [searchParams, startSubmission, updateSession]);
 
-  // 场景1: 粘贴文本 → 大模型生成思维导图
-  const handleTextGenerate = async () => {
-    const content = textContent.trim();
+  const isWorking = session.status === 'queued' || session.status === 'processing';
+  const hasPendingSubmit = Boolean(session.pendingSubmission && !session.taskId);
+
+  const handleTextGenerate = () => {
+    const content = session.textContent.trim();
     if (!content) return;
-    setTextLoading(true);
-    setMindmapContent('');
-    try {
-      const res = await postJSON<{ mindmap: string }>('/api/generate-mindmap', {
-        content,
-        language: 'zh',
-      });
-      setMindmapContent(res.mindmap);
-      toast('思维导图已生成', 'success');
-    } catch (e) {
-      toast(e instanceof Error ? e.message : '生成失败', 'error');
-    } finally {
-      setTextLoading(false);
-    }
+    void startSubmission(createMindMapSubmission('text', content));
   };
 
-  // 场景2: 视频URL/本地文件 → 下载+转录+摘要+思维导图（后端自动识别）
-  const handleVideoGenerate = async () => {
-    const input = extractBilibiliUrl(url.trim());
+  const handleVideoGenerate = () => {
+    const input = extractBilibiliUrl(session.url.trim());
     if (!input) return;
-    setVideoLoading(true);
-    setProgress(0);
-    setStatusMessage('正在提交任务...');
-    setMindmapContent('');
+    void startSubmission(createMindMapSubmission('video', input));
+  };
+
+  const handleCancel = async () => {
+    if (!session.taskId) return;
     try {
-      const res = await postFormData<{ task_id: string }>('/api/video-to-mindmap', {
-            url: input,
-            language: 'zh',
-          });
-      setTaskId(res.task_id);
-      connect(`/api/task-stream/${res.task_id}`, {
-        onMessage: (data) => {
-          const t = data as TaskStatus;
-          setProgress(t.progress);
-          setStatusMessage(t.message || '');
-          if (t.status === 'completed') {
-            if (t.mindmap) {
-              setMindmapContent(t.mindmap);
-              toast('思维导图生成完成！', 'success');
-            } else {
-              toast('视频处理完成，但未生成思维导图', 'info');
-            }
-            disconnect();
-            setVideoLoading(false);
-          } else if (t.status === 'error') {
-            disconnect();
-            setVideoLoading(false);
-            toast(t.error || '生成失败', 'error');
-          }
-        },
-        onError: () => {
-          setVideoLoading(false);
-          toast('连接中断', 'error');
-        },
-      });
-    } catch (e) {
-      toast(e instanceof Error ? e.message : '生成失败', 'error');
-      setVideoLoading(false);
+      const task = await fetchJSON<TaskStatus>(`/api/mindmap-tasks/${encodeURIComponent(session.taskId)}/cancel`, { method: 'POST' });
+      handleTaskUpdate(task);
+      if (task.cancel_requested) {
+        toast('已发送取消请求，等待后台任务确认', 'info');
+      }
+    } catch (error) {
+      toast(error instanceof Error ? error.message : '取消请求失败', 'error');
     }
   };
 
-  const handleCancelVideo = async () => {
-    if (taskId) {
-      try {
-        await deleteAPI(`/api/task/${taskId}`);
-      } catch (error) {
-        toast(error instanceof Error ? error.message : '取消任务失败', 'error');
-        return;
-      }
-    }
-    disconnect();
-    setVideoLoading(false);
-    setStatusMessage('');
-    setTaskId(null);
-    toast('已取消', 'info');
+  const handleRetryPending = () => {
+    if (session.pendingSubmission) void startSubmission(session.pendingSubmission);
   };
 
   return (
@@ -140,38 +191,39 @@ export default function MindMap() {
           {([
             { key: 'text' as InputMode, label: '输入内容' },
             { key: 'video' as InputMode, label: '从视频生成' },
-          ]).map((m) => (
+          ]).map((item) => (
             <button
-              key={m.key}
-              onClick={() => setMode(m.key)}
+              key={item.key}
+              onClick={() => updateSession({ mode: item.key })}
               className={`px-3 py-1.5 text-xs rounded-md font-medium transition-colors ${
-                mode === m.key
+                session.mode === item.key
                   ? 'bg-[var(--color-accent)] text-white'
                   : 'bg-[var(--color-bg)] text-[var(--color-text-secondary)] hover:bg-[var(--color-border-light)]'
               }`}
             >
-              {m.label}
+              {item.label}
             </button>
           ))}
         </div>
 
         <div className="space-y-3">
-          {mode === 'text' ? (
+          {session.mode === 'text' ? (
             <>
               <textarea
-                value={textContent}
-                onChange={(e) => setTextContent(e.target.value)}
+                value={session.textContent}
+                onChange={(event) => updateSession({ textContent: event.target.value })}
                 placeholder={'粘贴任意文本内容，AI 将自动提炼生成思维导图\n\n例如：课程笔记、文章摘要、会议纪要等'}
                 rows={14}
-                className="w-full border border-[var(--color-border)] rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-[var(--color-accent)] focus:ring-1 focus:ring-[var(--color-accent)]/20 resize-none"
+                disabled={isWorking || hasPendingSubmit}
+                className="w-full border border-[var(--color-border)] rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-[var(--color-accent)] focus:ring-1 focus:ring-[var(--color-accent)]/20 resize-none disabled:opacity-60"
               />
               <button
-                onClick={handleTextGenerate}
-                disabled={!textContent.trim() || textLoading}
+                onClick={hasPendingSubmit ? handleRetryPending : handleTextGenerate}
+                disabled={isWorking || (!hasPendingSubmit && !session.textContent.trim())}
                 className="w-full flex items-center justify-center gap-1.5 px-4 py-2.5 text-xs font-medium bg-[var(--color-accent)] text-white rounded-lg hover:bg-[var(--color-accent-hover)] disabled:opacity-40 transition-colors"
               >
-                {textLoading ? <Loader2 size={13} className="animate-spin" /> : <Play size={13} />}
-                {textLoading ? '生成中...' : '生成思维导图'}
+                {isWorking ? <Loader2 size={13} className="animate-spin" /> : <Play size={13} />}
+                {hasPendingSubmit ? '用同一请求确认任务' : isWorking ? '生成中...' : session.status === 'error' ? '重新生成' : '生成思维导图'}
               </button>
               <p className="text-[11px] text-[var(--color-text-muted)] leading-relaxed">
                 AI 会分析文本结构，自动提炼关键信息并生成可视化思维导图
@@ -180,31 +232,20 @@ export default function MindMap() {
           ) : (
             <>
               <input
-                value={url}
-                onChange={(e) => setUrl(e.target.value)}
+                value={session.url}
+                onChange={(event) => updateSession({ url: event.target.value })}
                 placeholder="粘贴视频链接或本地文件路径"
                 className="w-full border border-[var(--color-border)] rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-[var(--color-accent)] focus:ring-1 focus:ring-[var(--color-accent)]/20"
-                disabled={videoLoading}
+                disabled={isWorking || hasPendingSubmit}
               />
-
-              {videoLoading ? (
-                <button
-                  onClick={handleCancelVideo}
-                  className="w-full flex items-center justify-center gap-1.5 px-4 py-2.5 text-xs font-medium bg-red-50 text-red-600 border border-red-200 rounded-lg hover:bg-red-100 transition-colors"
-                >
-                  <Square size={13} />
-                  取消生成
-                </button>
-              ) : (
-                <button
-                  onClick={handleVideoGenerate}
-                  disabled={!url.trim()}
-                  className="w-full flex items-center justify-center gap-1.5 px-4 py-2.5 text-xs font-medium bg-[var(--color-accent)] text-white rounded-lg hover:bg-[var(--color-accent-hover)] disabled:opacity-40 transition-colors"
-                >
-                  <Play size={13} />
-                  生成
-                </button>
-              )}
+              <button
+                onClick={hasPendingSubmit ? handleRetryPending : handleVideoGenerate}
+                disabled={isWorking || (!hasPendingSubmit && !session.url.trim())}
+                className="w-full flex items-center justify-center gap-1.5 px-4 py-2.5 text-xs font-medium bg-[var(--color-accent)] text-white rounded-lg hover:bg-[var(--color-accent-hover)] disabled:opacity-40 transition-colors"
+              >
+                {isWorking ? <Loader2 size={13} className="animate-spin" /> : <Play size={13} />}
+                {hasPendingSubmit ? '用同一请求确认任务' : isWorking ? '生成中...' : session.status === 'error' ? '重新生成' : '生成'}
+              </button>
               <p className="text-[11px] text-[var(--color-text-muted)] leading-relaxed">
                 视频 → 转录 → 生成思维导图，支持在线链接和本地文件
               </p>
@@ -212,23 +253,42 @@ export default function MindMap() {
           )}
         </div>
 
-        {videoLoading && (
+        {(isWorking || hasPendingSubmit) && (
           <div className="mt-5 space-y-3">
-            <ProgressBar progress={progress} />
-            {statusMessage && (
+            {session.taskId && (
+              <button
+                onClick={handleCancel}
+                disabled={session.cancelRequested}
+                className="w-full flex items-center justify-center gap-1.5 px-4 py-2 text-xs font-medium bg-red-50 text-red-600 border border-red-200 rounded-lg hover:bg-red-100 disabled:opacity-60 transition-colors"
+              >
+                <Square size={13} />
+                {session.cancelRequested ? '取消请求已发送，等待后台确认' : '取消生成'}
+              </button>
+            )}
+            {session.taskId && <ProgressBar progress={session.progress} />}
+            {session.statusMessage && (
               <div className="flex items-center gap-2 text-xs text-[var(--color-text-secondary)]">
-                <Loader2 size={12} className="animate-spin" />
-                {statusMessage}
+                {isWorking && !session.cancelRequested && <Loader2 size={12} className="animate-spin" />}
+                {session.statusMessage}
               </div>
             )}
           </div>
         )}
+        {session.error && (
+          <p role="alert" className="mt-4 text-xs text-red-600 leading-relaxed">{session.error}</p>
+        )}
+        {session.status === 'cancelled' && (
+          <p className="mt-4 text-xs text-[var(--color-text-secondary)]">任务已取消。模型服务或底层工作可能仍在收尾。</p>
+        )}
+        {session.status === 'error' && !session.error && (
+          <p className="mt-4 text-xs text-red-600">任务失败，可手动重新生成。</p>
+        )}
       </div>
 
       <div className="flex-1 overflow-hidden relative">
-        {mindmapContent ? (
+        {session.mindmapContent ? (
           <Suspense fallback={<p className="text-sm text-[var(--color-text-muted)] text-center py-12">加载思维导图...</p>}>
-            <MarkmapView content={mindmapContent} className="absolute inset-0" />
+            <MarkmapView content={session.mindmapContent} className="absolute inset-0" />
           </Suspense>
         ) : (
           <div className="flex flex-col items-center justify-center h-full text-center">
@@ -236,10 +296,10 @@ export default function MindMap() {
               <BrainCircuit size={24} className="text-[var(--color-text-muted)]" />
             </div>
             <p className="text-sm text-[var(--color-text-secondary)] mb-1">
-              {mode === 'text' ? '粘贴文本内容，AI 生成思维导图' : '输入视频链接或本地路径，自动生成思维导图'}
+              {session.mode === 'text' ? '粘贴文本内容，AI 生成思维导图' : '输入视频链接或本地路径，自动生成思维导图'}
             </p>
             <p className="text-xs text-[var(--color-text-muted)]">
-              {mode === 'text' ? '支持任意文本：笔记、文章、会议记录等' : '支持 YouTube、Bilibili 等平台，或本地视频文件'}
+              {session.mode === 'text' ? '支持任意文本：笔记、文章、会议记录等' : '支持 YouTube、Bilibili 等平台，或本地视频文件'}
             </p>
           </div>
         )}

@@ -188,7 +188,10 @@ async def _process_video_task(task_id: str, url: str, summary_language: str):
 async def get_task_status(task_id: str):
     # 1. 先查内存（处理中/刚完成的任务）
     if task_id in tasks:
-        return tasks[task_id]
+        task_data = tasks[task_id]
+        if task_data.get("task_type") == "mindmap":
+            return {key: value for key, value in task_data.items() if key not in {"request_fingerprint", "mindmap_request_id"}}
+        return task_data
 
     # 2. 回退到 SQLite（已持久化的任务）
     from backend.services.note_repository import get_note, get_note_by_task_id
@@ -246,14 +249,18 @@ async def task_stream(task_id: str):
 
         try:
             current_task = tasks.get(task_id, {})
-            yield f"data: {json.dumps(current_task, ensure_ascii=False)}\n\n"
+            public_task = {key: value for key, value in current_task.items() if key not in {"request_fingerprint", "mindmap_request_id"}}
+            yield f"data: {json.dumps(public_task, ensure_ascii=False)}\n\n"
 
             while True:
                 try:
                     data = await asyncio.wait_for(queue.get(), timeout=15)
-                    yield f"data: {data}\n\n"
                     task_data = json.loads(data)
-                    if task_data.get("status") in ["completed", "error"]:
+                    if task_data.get("task_type") == "mindmap":
+                        task_data.pop("request_fingerprint", None)
+                        task_data.pop("mindmap_request_id", None)
+                    yield f"data: {json.dumps(task_data, ensure_ascii=False)}\n\n"
+                    if task_data.get("status") in ["completed", "error", "cancelled"]:
                         break
                 except asyncio.TimeoutError:
                     yield ": heartbeat\n\n"

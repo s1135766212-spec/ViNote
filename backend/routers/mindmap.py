@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import json
 import logging
 import os
 import uuid
@@ -22,6 +24,187 @@ router = APIRouter(prefix="/api")
 class MindmapRequest(BaseModel):
     content: str
     language: str = "zh"
+
+
+class TextMindmapTaskRequest(BaseModel):
+    content: str
+    language: str = "zh"
+    request_id: str
+
+
+def _validate_request_id(request_id: str) -> str:
+    try:
+        return str(uuid.UUID(request_id))
+    except (ValueError, TypeError, AttributeError):
+        raise HTTPException(status_code=422, detail="request_id 必须是有效的 UUID")
+
+
+def _request_fingerprint(kind: str, source: str, language: str) -> str:
+    payload = json.dumps(
+        {"kind": kind, "source": source, "language": language},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _find_mindmap_request(request_id: str, fingerprint: str) -> str | None:
+    for task_id, task_data in tasks.items():
+        if task_data.get("mindmap_request_id") != request_id:
+            continue
+        if task_data.get("request_fingerprint") != fingerprint:
+            raise HTTPException(
+                status_code=409,
+                detail="request_id 已用于不同的思维导图输入，请为新请求生成新的 request_id",
+            )
+        return task_id
+    return None
+
+
+def _start_mindmap_task(
+    request_id: str,
+    fingerprint: str,
+    task_data: dict,
+    worker,
+    *worker_args,
+) -> str:
+    existing_id = _find_mindmap_request(request_id, fingerprint)
+    if existing_id:
+        return existing_id
+
+    task_id = str(uuid.uuid4())
+    task_data.update({
+        "status": "processing",
+        "progress": 0,
+        "mindmap": None,
+        "error": None,
+        "task_type": "mindmap",
+        "mindmap_request_id": request_id,
+        "request_fingerprint": fingerprint,
+    })
+    tasks[task_id] = task_data
+    save_tasks(tasks)
+    active_tasks[task_id] = asyncio.create_task(worker(task_id, *worker_args))
+    return task_id
+
+
+async def _publish_task(task_id: str) -> None:
+    task_data = tasks.get(task_id)
+    if task_data is None:
+        return
+    save_tasks(tasks)
+    public_data = {key: value for key, value in task_data.items() if key not in {"request_fingerprint", "mindmap_request_id"}}
+    await broadcast_task_update(task_id, public_data)
+
+
+async def _complete_mindmap_task(task_id: str, mindmap: str, **metadata) -> None:
+    task_data = tasks.get(task_id)
+    if task_data is None:
+        return
+    if task_data.get("cancel_requested"):
+        task_data.update({"status": "cancelled", "progress": 0, "message": "后台任务已确认取消；模型服务或底层工作可能仍在收尾"})
+    else:
+        task_data.update({
+            "status": "completed",
+            "progress": 100,
+            "message": "✨ 思维导图生成完成！",
+            "mindmap": mindmap or "",
+            **metadata,
+        })
+    await _publish_task(task_id)
+
+
+async def _mark_mindmap_cancelled(task_id: str) -> None:
+    task_data = tasks.get(task_id)
+    if task_data is None:
+        return
+    task_data.update({
+        "status": "cancelled",
+        "progress": 0,
+        "message": "后台任务已确认取消；模型服务或底层工作可能仍在收尾",
+    })
+    await _publish_task(task_id)
+
+
+async def _mark_mindmap_failed(task_id: str, stage: str, error: Exception) -> None:
+    task_data = tasks.get(task_id)
+    if task_data is None:
+        return
+    if task_data.get("cancel_requested"):
+        await _mark_mindmap_cancelled(task_id)
+        return
+    message = f"{stage}失败（{type(error).__name__}），请查看服务端日志后重试"
+    task_data.update(task_failure(message))
+    await _publish_task(task_id)
+
+
+@router.post("/text-to-mindmap")
+async def generate_text_mindmap(req: TextMindmapTaskRequest):
+    """Create or retrieve an idempotent background text-to-mindmap task."""
+    content = req.content.strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="内容不能为空")
+    if len(content) > 50000:
+        raise HTTPException(status_code=400, detail="内容过长，请限制在 50000 字以内")
+    request_id = _validate_request_id(req.request_id)
+    fingerprint = _request_fingerprint("text", content, req.language)
+    task_id = _start_mindmap_task(
+        request_id,
+        fingerprint,
+        {"message": "正在生成思维导图...", "source": "text"},
+        _text_to_mindmap_task,
+        content,
+        req.language,
+    )
+    return {"task_id": task_id}
+
+
+async def _text_to_mindmap_task(task_id: str, content: str, language: str):
+    try:
+        summarizer = ContentSummarizer()
+        if not summarizer.is_available():
+            raise RuntimeError("AI 服务不可用")
+        mindmap = await summarizer.generate_mindmap(content, language)
+        if not mindmap:
+            raise RuntimeError("模型未返回思维导图内容")
+        await _complete_mindmap_task(task_id, mindmap)
+    except asyncio.CancelledError:
+        logger.info("思维导图文本任务 %s 已收到取消确认", task_id)
+        await _mark_mindmap_cancelled(task_id)
+    except Exception as e:
+        logger.exception("思维导图文本任务 %s 失败", task_id)
+        await _mark_mindmap_failed(task_id, "文本思维导图生成", e)
+    finally:
+        active_tasks.pop(task_id, None)
+
+
+@router.post("/mindmap-tasks/{task_id}/cancel")
+async def cancel_mindmap_task(task_id: str):
+    task_data = tasks.get(task_id)
+    if task_data is None or task_data.get("task_type") != "mindmap":
+        raise HTTPException(status_code=404, detail="思维导图任务不存在")
+    if task_data.get("status") in {"completed", "error", "cancelled"}:
+        return {key: value for key, value in task_data.items() if key not in {"request_fingerprint", "mindmap_request_id"}}
+
+    worker = active_tasks.get(task_id)
+    if worker is None or worker.done():
+        task_data.update({
+            "status": "error",
+            "error": "任务已失效：服务端没有可用的后台 worker，请手动重新生成",
+            "message": "任务已失效",
+            "cancel_requested": False,
+        })
+        await _publish_task(task_id)
+        return {key: value for key, value in task_data.items() if key not in {"request_fingerprint", "mindmap_request_id"}}
+
+    if not task_data.get("cancel_requested"):
+        task_data.update({
+            "cancel_requested": True,
+            "message": "已请求取消，等待后台任务确认；模型 API 请求可能仍在处理中",
+        })
+        await _publish_task(task_id)
+        worker.cancel()
+    return {key: value for key, value in task_data.items() if key not in {"request_fingerprint", "mindmap_request_id"}}
 
 
 @router.post("/generate-mindmap")
@@ -56,52 +239,46 @@ async def generate_mindmap(req: MindmapRequest):
 async def video_to_mindmap(
     url: str = Form(...),
     language: str = Form(default="zh"),
+    request_id: str = Form(...),
 ):
     """视频 → 下载 → 转录 → 生成思维导图（跳过优化/摘要/翻译）"""
+    request_id = _validate_request_id(request_id)
+    fingerprint = _request_fingerprint("video", url.strip(), language)
+
     # 防御：如果收到本地文件路径，自动走本地处理流程
     if os.path.exists(url) and os.path.isfile(url):
         from backend.utils.file_handler import MEDIA_EXTENSIONS
         file_ext = Path(url).suffix.lower()
         if file_ext in MEDIA_EXTENSIONS:
-            task_id = str(uuid.uuid4())
-            tasks[task_id] = {
-                "status": "processing",
-                "progress": 0,
-                "message": "开始处理本地文件...",
-                "mindmap": None,
-                "error": None,
-                "source": "local_path",
-                "file_path": url,
-            }
-            save_tasks(tasks)
-            task = asyncio.create_task(_local_video_to_mindmap_task(task_id, url, language))
-            active_tasks[task_id] = task
+            task_id = _start_mindmap_task(
+                request_id,
+                fingerprint,
+                {"message": "开始处理本地文件...", "source": "local_path", "file_path": url},
+                _local_video_to_mindmap_task,
+                url,
+                language,
+            )
             return {"task_id": task_id}
 
-    task_id = str(uuid.uuid4())
-
-    tasks[task_id] = {
-        "status": "processing",
-        "progress": 0,
-        "message": "开始处理...",
-        "mindmap": None,
-        "error": None,
-        "url": url,
-    }
-    save_tasks(tasks)
-
-    task = asyncio.create_task(_video_to_mindmap_task(task_id, url, language))
-    active_tasks[task_id] = task
-
+    task_id = _start_mindmap_task(
+        request_id,
+        fingerprint,
+        {"message": "开始处理...", "url": url},
+        _video_to_mindmap_task,
+        url,
+        language,
+    )
     return {"task_id": task_id}
 
 
 async def _video_to_mindmap_task(task_id: str, url: str, language: str):
     try:
         async def progress(pct: int, msg: str):
-            tasks[task_id].update({"progress": pct, "message": msg})
-            save_tasks(tasks)
-            await broadcast_task_update(task_id, tasks[task_id])
+            task_data = tasks.get(task_id)
+            if task_data is None or task_data.get("cancel_requested"):
+                raise asyncio.CancelledError
+            task_data.update({"progress": pct, "message": msg})
+            await _publish_task(task_id)
 
         async def on_stage(stage: str):
             mapped = {
@@ -119,28 +296,15 @@ async def _video_to_mindmap_task(task_id: str, url: str, language: str):
         summarizer = ContentSummarizer()
         mindmap = await summarizer.generate_mindmap(result.transcript, language)
 
-        tasks[task_id].update({
-            "status": "completed",
-            "progress": 100,
-            "message": "✨ 思维导图生成完成！",
-            "mindmap": mindmap or "",
-            "video_title": result.video_title,
-        })
-        save_tasks(tasks)
-        await broadcast_task_update(task_id, tasks[task_id])
+        await _complete_mindmap_task(task_id, mindmap, video_title=result.video_title)
 
     except asyncio.CancelledError:
         logger.info(f"思维导图任务 {task_id} 被取消")
-        if task_id in tasks:
-            tasks[task_id].update({"status": "cancelled", "message": "已取消"})
-            save_tasks(tasks)
-            await broadcast_task_update(task_id, tasks[task_id])
+        await _mark_mindmap_cancelled(task_id)
 
     except Exception as e:
-        logger.error(f"思维导图任务 {task_id} 失败: {e}")
-        tasks[task_id].update(task_failure("视频思维导图生成失败，请重试"))
-        save_tasks(tasks)
-        await broadcast_task_update(task_id, tasks[task_id])
+        logger.exception("思维导图任务 %s 失败", task_id)
+        await _mark_mindmap_failed(task_id, "视频思维导图生成", e)
 
     finally:
         active_tasks.pop(task_id, None)
@@ -192,9 +356,11 @@ async def local_video_to_mindmap(request: Request):
 async def _local_video_to_mindmap_task(task_id: str, file_path: str, language: str):
     try:
         async def progress(pct: int, msg: str):
-            tasks[task_id].update({"progress": pct, "message": msg})
-            save_tasks(tasks)
-            await broadcast_task_update(task_id, tasks[task_id])
+            task_data = tasks.get(task_id)
+            if task_data is None or task_data.get("cancel_requested"):
+                raise asyncio.CancelledError
+            task_data.update({"progress": pct, "message": msg})
+            await _publish_task(task_id)
 
         async def on_stage(stage: str):
             mapped = {
@@ -214,28 +380,15 @@ async def _local_video_to_mindmap_task(task_id: str, file_path: str, language: s
         summarizer = ContentSummarizer()
         mindmap = await summarizer.generate_mindmap(result.transcript, language)
 
-        tasks[task_id].update({
-            "status": "completed",
-            "progress": 100,
-            "message": "✨ 思维导图生成完成！",
-            "mindmap": mindmap or "",
-            "video_title": result.video_title,
-        })
-        save_tasks(tasks)
-        await broadcast_task_update(task_id, tasks[task_id])
+        await _complete_mindmap_task(task_id, mindmap, video_title=result.video_title)
 
     except asyncio.CancelledError:
         logger.info(f"本地思维导图任务 {task_id} 被取消")
-        if task_id in tasks:
-            tasks[task_id].update({"status": "cancelled", "message": "已取消"})
-            save_tasks(tasks)
-            await broadcast_task_update(task_id, tasks[task_id])
+        await _mark_mindmap_cancelled(task_id)
 
     except Exception as e:
-        logger.error(f"本地思维导图任务 {task_id} 失败: {e}")
-        tasks[task_id].update(task_failure("本地思维导图生成失败，请重试"))
-        save_tasks(tasks)
-        await broadcast_task_update(task_id, tasks[task_id])
+        logger.exception("本地思维导图任务 %s 失败", task_id)
+        await _mark_mindmap_failed(task_id, "本地视频思维导图生成", e)
 
     finally:
         active_tasks.pop(task_id, None)
