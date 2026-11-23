@@ -31,6 +31,9 @@ class ReasoningEffortConfigurationTests(unittest.TestCase):
     def test_explicit_low_is_loaded_and_trimmed(self):
         self.assertEqual(self.config(OPENAI_REASONING_EFFORT=" low ").reasoning_effort, "low")
 
+    def test_deepseek_none_disables_thinking(self):
+        self.assertEqual(self.config(OPENAI_REASONING_EFFORT="none").reasoning_effort, "none")
+
     def test_only_installed_sdk_declared_values_are_accepted(self):
         def values(annotation):
             for item in get_args(annotation):
@@ -41,8 +44,8 @@ class ReasoningEffortConfigurationTests(unittest.TestCase):
 
         expected = set(values(ReasoningEffort))
         self.assertTrue(expected)
-        self.assertEqual(self.module._REASONING_EFFORT_VALUES, expected)
-        for effort in expected:
+        self.assertEqual(self.module._REASONING_EFFORT_VALUES, expected | {"none"})
+        for effort in expected | {"none"}:
             self.assertEqual(self.config(OPENAI_REASONING_EFFORT=effort).reasoning_effort, effort)
 
     def test_invalid_environment_value_fails_without_echoing_it(self):

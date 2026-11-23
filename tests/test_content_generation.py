@@ -115,6 +115,32 @@ class ContentCompletionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(calls), 1)
 
 
+class SpokenSQLSummarySafetyTests(unittest.TestCase):
+    def test_ambiguous_spoken_sql_is_replaced_with_explicit_uncertainty(self):
+        module = load_offline_service("content_summarizer.py")
+        source = "视频讲解左连接，随后口述 B.score 一直 Noughten 按并自我更正。"
+        summary = (
+            "视频讲解 SQL 左连接。\n\n"
+            "SQL 代码形式为 SELECT * FROM student LEFT JOIN sc ON A.sid=B.sid。"
+            "筛选条件是 B.score IS NULL。"
+            "\n\nSQL 示例：B.score is not null。"
+        )
+
+        result = module._sanitize_spoken_sql_details(summary, source)
+
+        self.assertIn("视频讲解 SQL 左连接。", result)
+        self.assertIn("具体语句、标识符和条件无法确认", result)
+        self.assertEqual(result.count("具体语句、标识符和条件无法确认"), 1)
+        self.assertNotIn("SELECT *", result)
+        self.assertNotIn("B.score IS NULL", result)
+
+    def test_verified_sql_code_block_is_not_rewritten(self):
+        module = load_offline_service("content_summarizer.py")
+        source = "```sql\nSELECT * FROM students;\n```"
+        summary = "SQL 示例：SELECT * FROM students。"
+        self.assertEqual(module._sanitize_spoken_sql_details(summary, source), summary)
+
+
 class SourceGroundingTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.summary_module = load_offline_service("content_summarizer.py")

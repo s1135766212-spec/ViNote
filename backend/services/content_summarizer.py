@@ -19,6 +19,30 @@ logger = logging.getLogger(__name__)
 MAX_CONCURRENT_CHUNKS = 5
 MAX_MERGE_INPUT_CHARS = 10000
 MAX_MERGE_LEVELS = 8
+_SQL_SOURCE = re.compile(
+    r"\b(?:SQL|SELECT|JOIN|MYSQL)\b|(?:左|右|内|外)?连接|"
+    r"\b[A-Za-z_]\w*\.[A-Za-z_]\w*\b",
+    re.IGNORECASE,
+)
+_SQL_CODE = re.compile(
+    r"(?i)(?:\bSQL\s*(?:代码|语句)|\b(?:SELECT|FROM|WHERE)\b|"
+    r"\b(?:ON|WHERE)\s+[A-Za-z_]\w*\.[A-Za-z_]\w*|"
+    r"\b[A-Za-z_]\w*\.[A-Za-z_]\w*\b|\bIS\s+(?:NOT\s+)?NULL\b|`[^`]+`)"
+)
+_SQL_UNCERTAINTY = "转录提及 SQL 示例或筛选，但口述存在听写不清或自我更正；具体语句、标识符和条件无法确认。"
+
+
+def _sanitize_spoken_sql_details(summary: str, source: str) -> str:
+    """Do not turn spoken, unverified SQL ASR into exact code or conditions."""
+    if not _SQL_SOURCE.search(source) or re.search(r"```\s*sql\b", source, re.IGNORECASE):
+        return summary
+    paragraphs = []
+    for paragraph in summary.split("\n\n"):
+        safe_paragraph = _SQL_UNCERTAINTY if _SQL_CODE.search(paragraph) else paragraph
+        if safe_paragraph == _SQL_UNCERTAINTY and paragraphs and paragraphs[-1] == safe_paragraph:
+            continue
+        paragraphs.append(safe_paragraph)
+    return "\n\n".join(paragraphs)
 
 
 class ContentSummarizer:
@@ -87,7 +111,7 @@ class ContentSummarizer:
                     transcript, target_language, video_title, max_summarize_tokens
                 )
             if summary and summary.strip():
-                return summary
+                return _sanitize_spoken_sql_details(summary, transcript)
             logger.warning("AI 返回空摘要，生成备用摘要")
             self._warn("LLM 返回空内容，摘要使用备用版本")
             return self._generate_fallback_summary(transcript, target_language, video_title)

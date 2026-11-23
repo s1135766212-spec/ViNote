@@ -221,6 +221,37 @@ class StorageRegenerationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(files["summary_file"].read_text(), "old summary")
         self.assertEqual(files["mindmap_file"].read_text(), "old mindmap")
 
+    async def test_summary_regeneration_excludes_note_title_and_source_metadata(self):
+        files = await self.make_note()
+        await repository.update_note_artifacts("abcdef", warnings=["old AI fallback"])
+        files["transcript_file"].write_text(
+            "# MYSQL interview: left join, inner join and right join\n\n"
+            "> source link\n\n---\n\nOnly left join was explained.\n\n---\n\n*footer*",
+            encoding="utf-8",
+        )
+
+        await regeneration.regenerate_note("abcdef", ["summary"], "zh")
+
+        self.summarizer.summarize.assert_awaited_once_with(
+            "Only left join was explained.", "zh", "Demo"
+        )
+        note = await repository.get_note("abcdef")
+        self.assertEqual(note["warnings"], [])
+
+    async def test_mindmap_regeneration_excludes_note_title_and_source_metadata(self):
+        files = await self.make_note()
+        files["summary_file"].write_text(
+            "# MYSQL interview: left join, inner join and right join\n\n"
+            "> source link\n\n---\n\nOnly left join was explained.\n\n---\n\n*footer*",
+            encoding="utf-8",
+        )
+
+        await regeneration.regenerate_note("abcdef", ["mindmap"], "zh")
+
+        self.summarizer.generate_mindmap.assert_awaited_once_with(
+            "Only left join was explained.", "zh"
+        )
+
     async def test_degraded_summary_does_not_replace_saved_content(self):
         files = await self.make_note()
         self.summarizer.warnings.append("fallback output")

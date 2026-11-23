@@ -256,11 +256,13 @@ async def update_note_artifacts(short_id: str, **artifacts: Optional[str]) -> bo
     """只更新允许的产物文件字段，避免覆盖笔记其他元数据。"""
     allowed = {
         "raw_transcript_file", "transcript_file", "summary_file",
-        "mindmap_file", "translation_file",
+        "mindmap_file", "translation_file", "warnings",
     }
     values = {key: value for key, value in artifacts.items() if key in allowed}
     if not values:
         return False
+
+    warnings = values.pop("warnings", None)
 
     assignments = [f"{key} = ?" for key in values]
     if "summary_file" in values:
@@ -269,6 +271,9 @@ async def update_note_artifacts(short_id: str, **artifacts: Optional[str]) -> bo
     if "transcript_file" in values:
         assignments.append("has_transcript = ?")
         values["has_transcript"] = 1 if values["transcript_file"] else 0
+    if warnings is not None:
+        assignments.append("warnings_json = ?")
+        values["warnings_json"] = json.dumps(warnings, ensure_ascii=False)
 
     async with get_db() as db:
         cursor = await db.execute(

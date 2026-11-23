@@ -25,6 +25,12 @@ def _read_artifact(filename: str | None) -> str:
     return path.read_text(encoding="utf-8") if path else ""
 
 
+def _transcript_body(markdown: str) -> str:
+    """Remove saved note title/source/footer before passing transcript to the LLM."""
+    parts = re.split(r"(?m)^---\s*$", markdown, maxsplit=2)
+    return parts[1].strip() if len(parts) == 3 else markdown.strip()
+
+
 def _atomic_write(path: Path, content: str) -> None:
     temp_path = path.with_suffix(path.suffix + f".{uuid.uuid4().hex}.tmp")
     try:
@@ -63,6 +69,7 @@ async def _regenerate_note(short_id: str, targets: list[str], language: str) -> 
     generated_files: dict[Path, str] = {}
 
     transcript = _read_artifact(note.get("transcript_file"))
+    transcript_content = _transcript_body(transcript)
     if "transcript" in targets:
         raw = _read_artifact(note.get("raw_transcript_file")) or transcript
         if not raw.strip():
@@ -73,15 +80,16 @@ async def _regenerate_note(short_id: str, targets: list[str], language: str) -> 
         if optimizer.warnings:
             raise ValueError("AI 整理未完整成功，已保留原笔记，请稍后重试")
         transcript = f"# {title}\n\n> 🔗 **视频来源：** [点击观看]({url})\n\n---\n\n{optimized}\n\n---\n\n*整理时间：{now}*  \n*由 ViNote AI 自动生成*\n"
+        transcript_content = optimized
         path = _target_path(note.get("transcript_file"), "transcript", safe_title, short_id)
         generated_files[path] = transcript
         updated["transcript_file"] = path.name
 
     summary = _read_artifact(note.get("summary_file"))
     if "summary" in targets:
-        if not transcript.strip():
+        if not transcript_content.strip():
             raise ValueError("没有可用于生成摘要的笔记内容")
-        generated = await summarizer.summarize(transcript, language, title)
+        generated = await summarizer.summarize(transcript_content, language, title)
         if not generated.strip():
             raise ValueError("重新生成摘要返回空内容")
         if summarizer.warnings:
@@ -94,7 +102,7 @@ async def _regenerate_note(short_id: str, targets: list[str], language: str) -> 
     if "mindmap" in targets:
         if not summary.strip():
             raise ValueError("没有可用于生成思维导图的摘要")
-        mindmap = await summarizer.generate_mindmap(summary, language)
+        mindmap = await summarizer.generate_mindmap(_transcript_body(summary), language)
         if not mindmap.strip():
             raise ValueError("重新生成思维导图返回空内容")
         if summarizer.warnings:
@@ -103,6 +111,8 @@ async def _regenerate_note(short_id: str, targets: list[str], language: str) -> 
         generated_files[path] = mindmap
         updated["mindmap_file"] = path.name
 
+    # Clear stale warnings only after every requested artifact was generated successfully.
+    updated["warnings"] = []
     await finish_commit(_commit_artifacts(short_id, generated_files, updated))
     return {"short_id": short_id, "updated": sorted(targets)}
 

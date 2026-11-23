@@ -100,8 +100,9 @@ class TextOptimizer:
                 "**内容优化（正确性优先）：**\n"
                 "1. 仅在本次原文上下文足以确定时修正转录错误；保留不确定表达和明确写出的专业名称，不凭常识改名\n"
                 "2. 仅改善有原文依据的语法和标点，保持原意和语言不变；不得补写碎句缺失的事实\n"
-                "3. 口语处理：保留自然口语与重复表达，不要删减内容，仅添加必要标点\n"
-                "4. **绝对不要改变人称代词（I/我、you/你等）和说话者视角**\n\n"
+                "3. 口语处理：删除不承载意思的口头填充词和紧邻的逐字重复句；保留有强调或转折作用的重复及所有事实细节，仅补必要标点\n"
+                "4. SQL术语、表名、字段名、代码、条件和查询结果只有在原文清晰时才校正；本输入是语音识别文本，不是可核对的代码。不得把口述拼成SQL代码；遇到听写错词、自我更正或互相冲突时，保留不确定处并标注‘转录不清’，禁止按常见写法补全\n"
+                "5. **绝对不要改变人称代词（I/我、you/你等）和说话者视角**\n\n"
                 "**分段规则：**\n"
                 "- 按主题和逻辑含义分段，每段包含1-8个相关句子\n"
                 "- 单段长度不超过400字符（中文计为1字符）\n"
@@ -117,7 +118,8 @@ class TextOptimizer:
             )
             system_prompt = (
                 "你是专业的音频转录文本优化助手，修正错误、改善通顺度和排版格式，"
-                "必须保持原意，不得删减口语/重复/细节；仅移除时间戳或元信息。"
+                "必须保持原意和所有事实细节；只删除不承载意思的口头填充词及紧邻的逐字重复句，保留有强调或转折作用的重复；仅移除时间戳或元信息。"
+                "SQL术语、标识符、代码、条件和查询结果只有原文清晰时才能校正；本输入是语音识别文本，不是可核对的代码，禁止把口述拼成SQL代码；模糊或冲突处标注‘转录不清’，不得按常见写法补全。"
                 "绝对不要改变人称代词或说话者视角。"
             )
         else:
@@ -126,8 +128,9 @@ class TextOptimizer:
                 "**Content Optimization (Accuracy First):**\n"
                 "1. Correct transcription errors only when the supplied context establishes the correction; preserve uncertain wording and explicit technical spellings\n"
                 "2. Improve grammar and punctuation without filling in facts missing from fragmented sentences\n"
-                "3. Spoken language processing: Retain natural speech patterns and repetitions, no content deletion, only add essential punctuation\n"
-                "4. **Absolutely DO NOT alter personal pronouns (I/me, you, etc.) or speaker perspective**\n\n"
+                "3. Spoken language processing: Remove non-semantic filler words and immediately repeated verbatim sentences; retain purposeful emphasis or contrast and every factual detail\n"
+                "4. Correct SQL terms, identifiers, code, conditions, and query results only when clearly spoken; mark garbled, self-corrected, or conflicting parts as unclear and never reconstruct conventional SQL from context\n"
+                "5. **Absolutely DO NOT alter personal pronouns (I/me, you, etc.) or speaker perspective**\n\n"
                 "**Paragraph Rules:**\n"
                 "- Segment by topic and logical meaning (1-8 related sentences per paragraph)\n"
                 "- Maximum 400 characters per paragraph (Chinese characters count as 1)\n"

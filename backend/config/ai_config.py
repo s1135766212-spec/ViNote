@@ -16,6 +16,8 @@ _REASONING_EFFORT_VALUES = frozenset(
     for value in (get_args(member) or (member,))
     if isinstance(value, str)
 )
+# DeepSeek's OpenAI-compatible endpoint also accepts `none` to disable thinking.
+_REASONING_EFFORT_VALUES = _REASONING_EFFORT_VALUES | {"none"}
 
 # 加载环境变量
 PROJECT_ROOT = Path(__file__).parent.parent.parent
