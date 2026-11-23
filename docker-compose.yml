@@ -14,6 +14,7 @@ services:
       dockerfile: Dockerfile
       args:
         ASR_PROVIDER: ${ASR_PROVIDER:-whisper}
+        no_proxy: deb.debian.org
     image: vinote:latest
     container_name: vinote
     restart: unless-stopped
@@ -23,6 +24,7 @@ services:
       - .env
     environment:
       - PYTHONUNBUFFERED=1
+      - HF_HOME=/app/temp/huggingface
     volumes:
       # 持久化临时文件（下载的音频、转录结果等）
       - vinote-temp:/app/temp
