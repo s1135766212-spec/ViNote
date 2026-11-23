@@ -288,7 +288,7 @@ export default function MindMap() {
       <div className="flex-1 overflow-hidden relative">
         {session.mindmapContent ? (
           <Suspense fallback={<p className="text-sm text-[var(--color-text-muted)] text-center py-12">加载思维导图...</p>}>
-            <MarkmapView content={session.mindmapContent} className="absolute inset-0" />
+            <MarkmapView content={session.mindmapContent} className="h-full" />
           </Suspense>
         ) : (
           <div className="flex flex-col items-center justify-center h-full text-center">

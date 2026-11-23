@@ -1,7 +1,8 @@
-import { useEffect, useRef } from 'react';
+import { useCallback, useEffect, useRef } from 'react';
 import { Transformer } from 'markmap-lib';
 import { Markmap } from 'markmap-view';
 import { ZoomIn, ZoomOut, Maximize2 } from 'lucide-react';
+import { fitMarkmapWhenSized } from './markmapViewport.js';
 
 const transformer = new Transformer();
 
@@ -11,8 +12,46 @@ interface MarkmapViewProps {
 }
 
 export default function MarkmapView({ content, className }: MarkmapViewProps) {
+  const containerRef = useRef<HTMLDivElement>(null);
   const svgRef = useRef<SVGSVGElement>(null);
   const mmRef = useRef<Markmap | null>(null);
+  const fitFrameRef = useRef<number | null>(null);
+
+  const scheduleFit = useCallback(() => {
+    if (document.visibilityState === 'hidden') return;
+    if (fitFrameRef.current !== null) cancelAnimationFrame(fitFrameRef.current);
+
+    // Wait two frames so flex layout and Markmap's SVG nodes have both settled.
+    fitFrameRef.current = requestAnimationFrame(() => {
+      fitFrameRef.current = requestAnimationFrame(() => {
+        fitFrameRef.current = null;
+        fitMarkmapWhenSized(containerRef.current, () => mmRef.current?.fit());
+      });
+    });
+  }, []);
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    const observer = typeof ResizeObserver !== 'undefined'
+      ? new ResizeObserver(scheduleFit)
+      : null;
+    observer?.observe(container);
+    window.addEventListener('resize', scheduleFit);
+    document.addEventListener('visibilitychange', scheduleFit);
+    scheduleFit();
+
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener('resize', scheduleFit);
+      document.removeEventListener('visibilitychange', scheduleFit);
+      if (fitFrameRef.current !== null) {
+        cancelAnimationFrame(fitFrameRef.current);
+        fitFrameRef.current = null;
+      }
+    };
+  }, [scheduleFit]);
 
   useEffect(() => {
     if (!svgRef.current || !content) return;
@@ -21,14 +60,15 @@ export default function MarkmapView({ content, className }: MarkmapViewProps) {
 
     if (mmRef.current) {
       mmRef.current.setData(root);
-      mmRef.current.fit();
+      scheduleFit();
     } else {
       mmRef.current = Markmap.create(svgRef.current, {
-        autoFit: true,
+        autoFit: false,
         duration: 500,
       }, root);
+      scheduleFit();
     }
-  }, [content]);
+  }, [content, scheduleFit]);
 
   useEffect(() => {
     return () => {
@@ -44,7 +84,10 @@ export default function MarkmapView({ content, className }: MarkmapViewProps) {
   const handleFit = () => mmRef.current?.fit();
 
   return (
-    <div className={`relative w-full ${className || ''}`} style={{ minHeight: 400, height: '100%' }}>
+    <div
+      ref={containerRef}
+      className={`relative w-full min-h-[400px] ${className || 'h-[70vh] max-h-[800px]'}`}
+    >
       <style>{`
         .markmap-wrap svg text,
         .markmap-wrap svg foreignObject,
@@ -67,7 +110,7 @@ export default function MarkmapView({ content, className }: MarkmapViewProps) {
         }
       `}</style>
 
-      <div className="markmap-wrap w-full" style={{ height: '100%' }}>
+      <div className="markmap-wrap absolute inset-0 w-full h-full">
         <svg ref={svgRef} style={{ width: '100%', height: '100%' }} />
       </div>
 
